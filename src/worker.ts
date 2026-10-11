@@ -180,38 +180,72 @@ export function json(data: unknown, status = 200, extra: Record<string, string> 
 // ---------------------------------------------------------------------------
 
 export async function rateLimit(
-  ip: string,
-  kv: KVNamespace | undefined,
-  type: 'general' | 'llm'
+  identifier: string,
+  type: 'general' | 'llm',
+  db?: D1Database,
+  kv?: KVNamespace
 ): Promise<{ allowed: boolean; resetIn: number }> {
-  if (!kv) {
-    // If KV is unconfigured: fail closed on expensive paid routes
-    return { allowed: type !== 'llm', resetIn: 60_000 };
-  }
-
   const max = type === 'llm' ? 25 : 120;
   const windowMs = 60_000;
-  const key = `rl:${type}:${ip}`;
+  const now = Date.now();
 
-  try {
-    const raw = await kv.get<{ n: number; exp: number }>(key, 'json');
-    const now = Date.now();
-    if (!raw || now > raw.exp) {
-      await kv.put(key, JSON.stringify({ n: 1, exp: now + windowMs }), { expirationTtl: 60 });
+  // 1. Atomic D1 Rate Limiting (F-09: serialized atomic SQLite upsert)
+  if (db) {
+    try {
+      const windowStart = new Date(Math.floor(now / windowMs) * windowMs).toISOString();
+      const res = await db
+        .prepare(
+          `INSERT INTO rate_limits (ip_address, route_type, window_start, request_count)
+           VALUES (?, ?, ?, 1)
+           ON CONFLICT(ip_address, route_type, window_start)
+           DO UPDATE SET request_count = request_count + 1
+           RETURNING request_count`
+        )
+        .bind(identifier, type, windowStart)
+        .first<{ request_count: number }>();
+
+      const count = res?.request_count ?? 1;
+      const windowEnd = Math.floor(now / windowMs) * windowMs + windowMs;
+      const resetIn = Math.max(1000, windowEnd - now);
+
+      if (count > max) {
+        return { allowed: false, resetIn };
+      }
+      return { allowed: true, resetIn };
+    } catch {
+      // Fail closed on paid/cost-bearing routes if D1 errors (F-09)
+      if (type === 'llm') {
+        return { allowed: false, resetIn: windowMs };
+      }
+      // If D1 fails on general routes, fall through to KV
+    }
+  }
+
+  // 2. KV Fallback
+  if (kv) {
+    const key = `rl:${type}:${identifier}`;
+    try {
+      const raw = await kv.get<{ n: number; exp: number }>(key, 'json');
+      if (!raw || now > raw.exp) {
+        await kv.put(key, JSON.stringify({ n: 1, exp: now + windowMs }), { expirationTtl: 60 });
+        return { allowed: true, resetIn: windowMs };
+      }
+      if (raw.n >= max) {
+        return { allowed: false, resetIn: Math.max(1000, raw.exp - now) };
+      }
+      await kv.put(key, JSON.stringify({ n: raw.n + 1, exp: raw.exp }), { expirationTtl: 60 });
+      return { allowed: true, resetIn: Math.max(1000, raw.exp - now) };
+    } catch {
+      // Fail closed on LLM routes when KV errors (F-09)
+      if (type === 'llm') {
+        return { allowed: false, resetIn: windowMs };
+      }
       return { allowed: true, resetIn: windowMs };
     }
-    if (raw.n >= max) {
-      return { allowed: false, resetIn: Math.max(1000, raw.exp - now) };
-    }
-    await kv.put(key, JSON.stringify({ n: raw.n + 1, exp: raw.exp }), { expirationTtl: 60 });
-    return { allowed: true, resetIn: Math.max(1000, raw.exp - now) };
-  } catch {
-    // Fail closed on LLM routes when KV errors (F-09)
-    if (type === 'llm') {
-      return { allowed: false, resetIn: windowMs };
-    }
-    return { allowed: true, resetIn: windowMs };
   }
+
+  // Neither D1 nor KV configured: fail closed on expensive paid routes
+  return { allowed: type !== 'llm', resetIn: windowMs };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +294,7 @@ export async function handleStatus(env: Env): Promise<Response> {
       groq: !!env.GROQ_API_KEY,
       openai: !!env.OPENAI_API_KEY,
     },
+    defaultProvider: env.GEMINI_API_KEY ? 'gemini' : (env.OPENROUTER_API_KEY ? 'openrouter' : null),
     runtime: 'cloudflare-workers',
     timestamp: new Date().toISOString(),
   });
@@ -365,10 +400,12 @@ export async function handleTranscript(req: Request, env: Env): Promise<Response
           if (trackMatch) {
             const captionBaseUrl = trackMatch[1].replace(/\\u0026/g, '&');
             const vttUrl = `${captionBaseUrl}&fmt=vtt`;
-            const vttRes = await fetch(vttUrl, { signal: AbortSignal.timeout(6000) });
-            if (vttRes.ok) {
-              const vttText = await vttRes.text();
-              segments = parseSubtitleText(vttText);
+            if (isSafeWorkerUrl(vttUrl)) {
+              const vttRes = await fetch(vttUrl, { signal: AbortSignal.timeout(6000) });
+              if (vttRes.ok) {
+                const vttText = await vttRes.text();
+                segments = parseSubtitleText(vttText);
+              }
             }
           }
         }
@@ -441,7 +478,7 @@ export async function handleTranscript(req: Request, env: Env): Promise<Response
   }
 
   // Direct pasted text
-  if (detected.type === 'direct_text' && rawInput.length > 25) {
+  if (detected.type === 'direct_text' && rawInput.length >= 10) {
     const segments = parseSubtitleText(rawInput);
     const fullText = segments.length ? segments.map((s) => s.text).join(' ') : rawInput;
     const totalWords = fullText.split(/\s+/).filter(Boolean).length;
@@ -536,11 +573,32 @@ async function executeAiGeneration(
     };
   }
 
-  const requestedModel = sanitizeModelId(reqModel);
-
-  // Gemini Path
+  let modelToUse = '';
   if (activeProvider === 'gemini') {
-    const modelToUse = requestedModel || 'gemini-2.0-flash-lite';
+    const validGeminiModels = new Set([
+      'gemini-2.0-flash',
+      'gemini-2.0-flash-lite',
+      'gemini-2.0-flash-exp',
+      'gemini-2.0-flash-thinking-exp',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro',
+    ]);
+    if (reqModel) {
+      const sanitized = sanitizeModelId(reqModel);
+      if (!sanitized || !validGeminiModels.has(sanitized)) {
+        return {
+          ok: false,
+          markdown: '',
+          modelUsed: '',
+          providerUsed: 'gemini',
+          error: `Invalid or unsupported Gemini model "${reqModel}".`,
+        };
+      }
+      modelToUse = sanitized;
+    } else {
+      modelToUse = 'gemini-2.0-flash-lite';
+    }
+
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${modelToUse}:generateContent?key=${activeKey}`,
@@ -568,7 +626,22 @@ async function executeAiGeneration(
 
   // OpenRouter Path
   if (activeProvider === 'openrouter') {
-    const modelToUse = requestedModel || 'meta-llama/llama-3.3-70b-instruct:free';
+    if (reqModel) {
+      const sanitized = sanitizeModelId(reqModel);
+      if (!sanitized || !/^[a-zA-Z0-9_\-\.]+\/[a-zA-Z0-9_\-\.:]+$/.test(sanitized)) {
+        return {
+          ok: false,
+          markdown: '',
+          modelUsed: '',
+          providerUsed: 'openrouter',
+          error: `Invalid or unsupported OpenRouter model "${reqModel}".`,
+        };
+      }
+      modelToUse = sanitized;
+    } else {
+      modelToUse = 'meta-llama/llama-3.3-70b-instruct:free';
+    }
+
     try {
       const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
@@ -620,12 +693,13 @@ export async function handleSummarize(req: Request, env: Env): Promise<Response>
 
   // Model selection parameter standardization (F-11)
   const selectedModel = model || openRouterModel;
+  const defaultProv = env.GEMINI_API_KEY ? 'gemini' : (env.OPENROUTER_API_KEY ? 'openrouter' : 'gemini');
 
   const truncated = transcript.slice(0, 90_000);
   const systemPrompt = `You are an expert video summarizer. Create a ${summaryType} summary of the following transcript. Use markdown headings, bullet points, and bold key terms. Include timestamps when referenced.`;
 
   const result = await executeAiGeneration(truncated, systemPrompt, {
-    provider: provider || (env.GEMINI_API_KEY ? 'gemini' : 'openrouter'),
+    provider: provider || defaultProv,
     model: selectedModel,
     openRouterKey: userOrKey,
     geminiKey,
@@ -634,7 +708,11 @@ export async function handleSummarize(req: Request, env: Env): Promise<Response>
   });
 
   if (!result.ok) {
-    const status = result.error?.includes('Authentication') ? 401 : 502;
+    const status = result.error?.includes('Authentication')
+      ? 401
+      : result.error?.includes('Invalid or unsupported')
+      ? 400
+      : 502;
     return json({ ok: false, error: result.error }, status);
   }
 
@@ -1105,6 +1183,284 @@ export async function handleImageProxy(req: Request): Promise<Response> {
   }
 }
 
+// --- /api/community-search (F-07) ---
+export async function handleCommunitySearch(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const q = (url.searchParams.get('q') || '').trim().slice(0, 300);
+  if (!q) return json({ error: 'Query parameter q is required.' }, 400);
+
+  const discussions: Array<any> = [];
+
+  await Promise.allSettled([
+    // 1. Hacker News Algolia API
+    (async () => {
+      try {
+        const hnUrl = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(q)}&tags=story&hitsPerPage=6`;
+        const res = await fetch(hnUrl, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          for (const hit of data.hits || []) {
+            if (!hit.title) continue;
+            discussions.push({
+              id: `hn-${hit.objectID}`,
+              title: hit.title,
+              snippet: `Hacker News thread · ${hit.points || 0} upvotes · ${hit.num_comments || 0} comments`,
+              url: `https://news.ycombinator.com/item?id=${hit.objectID}`,
+              author: hit.author || 'HN User',
+              community: 'Hacker News',
+              score: hit.points || 0,
+              commentsCount: hit.num_comments || 0,
+              publishedAt: hit.created_at,
+              source: 'Hacker News',
+            });
+          }
+        }
+      } catch {}
+    })(),
+
+    // 2. DEV.to Articles API
+    (async () => {
+      try {
+        const devUrl = `https://dev.to/api/articles?per_page=6&q=${encodeURIComponent(q)}`;
+        const res = await fetch(devUrl, {
+          headers: { 'User-Agent': 'OpenTranscriptAI/1.0' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as any[];
+          if (Array.isArray(data)) {
+            for (const art of data) {
+              if (!art.title) continue;
+              discussions.push({
+                id: `devto-${art.id}`,
+                title: art.title,
+                snippet: art.description || `Technical article by ${art.user?.name || 'Engineer'}`,
+                url: art.url,
+                author: art.user?.name || 'DEV Author',
+                community: 'DEV.to Engineering',
+                score: art.public_reactions_count || 0,
+                commentsCount: art.comments_count || 0,
+                publishedAt: art.published_at,
+                source: 'DEV.to',
+              });
+            }
+          }
+        }
+      } catch {}
+    })(),
+
+    // 3. Reddit Search
+    (async () => {
+      try {
+        const rdUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(q)}&sort=relevance&limit=6`;
+        const res = await fetch(rdUrl, {
+          headers: { 'User-Agent': 'OpenTranscriptAI/1.0 (Research Client)' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          for (const child of data.data?.children || []) {
+            const post = child.data;
+            if (!post?.title) continue;
+            discussions.push({
+              id: `rd-${post.id}`,
+              title: post.title,
+              snippet: post.selftext ? String(post.selftext).slice(0, 280) : `Community thread in r/${post.subreddit}`,
+              url: `https://www.reddit.com${post.permalink}`,
+              author: `u/${post.author || 'redditor'}`,
+              community: `r/${post.subreddit || 'technology'}`,
+              score: post.score || 0,
+              commentsCount: post.num_comments || 0,
+              publishedAt: post.created_utc ? new Date(post.created_utc * 1000).toISOString() : undefined,
+              source: 'Reddit',
+            });
+          }
+        }
+      } catch {}
+    })(),
+  ]);
+
+  return json({ ok: true, results: discussions });
+}
+
+// --- /api/podcasts-datasets (F-07) ---
+export async function handlePodcastsDatasets(req: Request, _env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const q = (url.searchParams.get('q') || '').trim().slice(0, 300);
+  if (!q) return json({ error: 'Query parameter q is required.' }, 400);
+
+  const items: Array<any> = [];
+
+  await Promise.allSettled([
+    // 1. Apple iTunes Podcasts API
+    (async () => {
+      try {
+        const itunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=podcast&entity=podcastEpisode&limit=8`;
+        const res = await fetch(itunesUrl, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          for (const ep of data.results || []) {
+            if (!ep.trackName) continue;
+            items.push({
+              id: `pod-${ep.trackId || Math.random().toString(36).slice(2, 8)}`,
+              title: ep.trackName,
+              creator: ep.collectionName || ep.artistName || 'Podcast Series',
+              description: ep.description ? String(ep.description).replace(/<[^>]+>/g, '').slice(0, 280) : 'Podcast episode.',
+              url: ep.trackViewUrl || ep.collectionViewUrl || 'https://podcasts.apple.com',
+              audioOrDownloadUrl: ep.episodeUrl || ep.previewUrl,
+              thumbnailUrl: ep.artworkUrl160 || ep.artworkUrl60,
+              publishedAt: ep.releaseDate,
+              durationOrSize: ep.trackTimeMillis ? `${Math.round(ep.trackTimeMillis / 60000)} min` : undefined,
+              category: 'Podcast Episode',
+            });
+          }
+        }
+      } catch {}
+    })(),
+
+    // 2. Zenodo Open Science Datasets API
+    (async () => {
+      try {
+        const zenUrl = `https://zenodo.org/api/records?q=${encodeURIComponent(q)}&size=6`;
+        const res = await fetch(zenUrl, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          for (const rec of data.hits?.hits || []) {
+            if (!rec.metadata?.title) continue;
+            items.push({
+              id: `zen-${rec.id}`,
+              title: rec.metadata.title,
+              creator: rec.metadata.creators?.[0]?.name || 'Zenodo Open Science',
+              description: rec.metadata.description ? String(rec.metadata.description).replace(/<[^>]+>/g, '').slice(0, 280) : 'Open science dataset.',
+              url: rec.links?.html || `https://zenodo.org/record/${rec.id}`,
+              publishedAt: rec.metadata.publication_date,
+              category: 'Zenodo Dataset',
+            });
+          }
+        }
+      } catch {}
+    })(),
+  ]);
+
+  return json({ ok: true, results: items });
+}
+
+// --- /api/image-search (F-07) ---
+export async function handleImageSearch(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const q = (url.searchParams.get('q') || '').trim().slice(0, 300);
+  if (!q) return json({ error: 'Search query parameter q is required.' }, 400);
+
+  const images: Array<any> = [];
+
+  // Google CSE if configured
+  if (env.GOOGLE_API_KEY && env.GOOGLE_CSE_ID) {
+    try {
+      const cseUrl = `https://www.googleapis.com/customsearch/v1?q=${encodeURIComponent(q)}&searchType=image&num=10&key=${env.GOOGLE_API_KEY}&cx=${encodeURIComponent(env.GOOGLE_CSE_ID)}`;
+      const res = await fetch(cseUrl, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        for (const item of data.items || []) {
+          images.push({
+            id: `cse-img-${Math.random().toString(36).slice(2, 8)}`,
+            title: item.title || q,
+            url: item.link,
+            thumbnailUrl: item.image?.thumbnailLink || item.link,
+            sourceUrl: item.image?.contextLink || item.link,
+            sourceName: item.displayLink || 'Google Images',
+            width: item.image?.width,
+            height: item.image?.height,
+            description: item.snippet || item.title,
+          });
+        }
+      }
+    } catch {}
+  }
+
+  // Wikimedia Commons Search Fallback
+  if (images.length === 0) {
+    try {
+      const wikiUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(q)}&gsrlimit=10&prop=imageinfo&iiprop=url|size&format=json&origin=*`;
+      const res = await fetch(wikiUrl, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const pages = data.query?.pages || {};
+        for (const key of Object.keys(pages)) {
+          const p = pages[key];
+          const info = p.imageinfo?.[0];
+          if (!info?.url) continue;
+          images.push({
+            id: `wiki-img-${p.pageid || key}`,
+            title: p.title?.replace(/^File:/, '') || q,
+            url: info.url,
+            thumbnailUrl: info.thumburl || info.url,
+            sourceUrl: info.descriptionurl || info.url,
+            sourceName: 'Wikimedia Commons',
+            width: info.width,
+            height: info.height,
+            description: p.title || q,
+          });
+        }
+      }
+    } catch {}
+  }
+
+  return json({ ok: true, results: images });
+}
+
+// --- /api/news-search (F-07) ---
+export async function handleNewsSearch(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const q = (url.searchParams.get('q') || '').trim().slice(0, 300);
+  if (!q) return json({ error: 'Search query parameter q is required.' }, 400);
+
+  const newsItems: Array<any> = [];
+
+  // Google CSE if configured
+  if (env.GOOGLE_API_KEY && env.GOOGLE_CSE_ID) {
+    try {
+      const cseUrl = `https://www.googleapis.com/customsearch/v1?q=${encodeURIComponent(q)}&num=10&key=${env.GOOGLE_API_KEY}&cx=${encodeURIComponent(env.GOOGLE_CSE_ID)}`;
+      const res = await fetch(cseUrl, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        for (const item of data.items || []) {
+          newsItems.push({
+            id: `cse-news-${Math.random().toString(36).slice(2, 8)}`,
+            title: item.title,
+            snippet: item.snippet,
+            url: item.link,
+            source: item.displayLink || 'Web News',
+            publishedAt: new Date().toISOString(),
+          });
+        }
+      }
+    } catch {}
+  }
+
+  // Wikipedia Search fallback
+  if (newsItems.length === 0) {
+    try {
+      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=8`;
+      const res = await fetch(wikiUrl, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        for (const item of data.query?.search || []) {
+          newsItems.push({
+            id: `wiki-news-${item.pageid}`,
+            title: item.title,
+            snippet: String(item.snippet || '').replace(/<[^>]+>/g, ''),
+            url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, '_'))}`,
+            source: 'Wikipedia Encyclopedia',
+            publishedAt: item.timestamp,
+          });
+        }
+      }
+    } catch {}
+  }
+
+  return json({ ok: true, results: newsItems });
+}
+
 // --- /api/transcribe-audio ---
 export async function handleTranscribeAudio(req: Request, env: Env): Promise<Response> {
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
@@ -1114,6 +1470,12 @@ export async function handleTranscribeAudio(req: Request, env: Env): Promise<Res
 
   if (!audioBase64) {
     return json({ error: 'Audio payload audioBase64 is required.' }, 400);
+  }
+
+  // Validate decoded size bound (F-16: 25 MB decoded threshold -> 413)
+  const approxBytes = Math.round((audioBase64.length * 3) / 4);
+  if (approxBytes > 25 * 1024 * 1024) {
+    return json({ error: 'Uploaded media file exceeds maximum allowed limit of 25 MB.' }, 413);
   }
 
   const authenticatedUser = await authenticateWorkerRequest(req, env);
@@ -1383,7 +1745,7 @@ export default {
         '/api/tts',
       ].includes(path);
 
-      const rl = await rateLimit(ip, env.CACHE, isLlm ? 'llm' : 'general');
+      const rl = await rateLimit(ip, isLlm ? 'llm' : 'general', env.DB, env.CACHE);
       if (!rl.allowed) {
         const retryAfter = String(Math.ceil(rl.resetIn / 1000));
         const resCors = corsHeaders(origin, env);
@@ -1435,13 +1797,15 @@ export default {
     } else if (path === '/api/github-search') {
       response = await handleGithubSearch(request);
     } else if (path === '/api/community-search') {
-      response = json({ ok: true, results: [] });
+      response = await handleCommunitySearch(request);
     } else if (path === '/api/podcasts-datasets') {
-      response = json({ ok: true, results: [] });
+      response = await handlePodcastsDatasets(request, env);
     } else if (path === '/api/web-search') {
       response = await handleWebSearch(request, env);
-    } else if (path === '/api/image-search' || path === '/api/news-search') {
-      response = json({ ok: true, results: [] });
+    } else if (path === '/api/image-search') {
+      response = await handleImageSearch(request, env);
+    } else if (path === '/api/news-search') {
+      response = await handleNewsSearch(request, env);
     } else if (path === '/api/image-proxy') {
       response = await handleImageProxy(request);
     } else if (path === '/api/transcribe-audio') {

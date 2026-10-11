@@ -43,10 +43,10 @@ if [ "$dbChoice" = "y" ]; then
     databaseId=$(echo "$dbOutput" | grep -oP 'database_id\s*=\s*"\K[^"]+')
     if [ ! -z "$databaseId" ]; then
         echo "✓ D1 database created with ID: $databaseId"
-        echo ""
-        echo "IMPORTANT: Update wrangler.toml with this database ID:"
-        echo "  database_id = \"$databaseId\""
-        echo ""
+        if [ -f "wrangler.toml" ]; then
+            sed -i.bak -E "s/database_id = \".*\"/database_id = \"$databaseId\"/" wrangler.toml && rm -f wrangler.toml.bak
+            echo "✓ Automatically updated wrangler.toml with database ID: $databaseId"
+        fi
     else
         echo "! Could not extract database ID from output"
         echo "Please check the output above and update wrangler.toml manually"
@@ -88,10 +88,10 @@ if [ "$kvChoice" = "y" ]; then
     kvId=$(echo "$kvOutput" | grep -oP 'id\s*=\s*"\K[^"]+')
     if [ ! -z "$kvId" ]; then
         echo "✓ KV namespace created with ID: $kvId"
-        echo ""
-        echo "IMPORTANT: Update wrangler.toml with this KV namespace ID:"
-        echo "  id = \"$kvId\""
-        echo ""
+        if [ -f "wrangler.toml" ]; then
+            sed -i.bak -E "s/id = \".*\"/id = \"$kvId\"/" wrangler.toml && rm -f wrangler.toml.bak
+            echo "✓ Automatically updated wrangler.toml with KV ID: $kvId"
+        fi
     else
         echo "! Could not extract KV ID from output"
         echo "Please check the output above and update wrangler.toml manually"

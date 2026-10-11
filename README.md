@@ -143,7 +143,7 @@ Seven daylight themes and eight dark themes, all designed to be actually pleasan
 
 ### Prerequisites
 
-- Node.js v18+
+- Node.js v20.19+ or v22 LTS (required by Vite 8)
 - npm v9+
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up) (free)
 - At minimum one AI API key (Gemini free tier is enough to start)

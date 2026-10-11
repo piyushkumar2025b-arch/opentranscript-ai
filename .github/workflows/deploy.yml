@@ -74,3 +74,11 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: d1 execute opentranscript-db --file=./cloudflare.d1.schema.sql --remote
+
+      - name: Verify remote D1 tables (production only)
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute opentranscript-db --command="SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'saved_lists', 'list_items', 'saved_summaries', 'activity_history');" --remote

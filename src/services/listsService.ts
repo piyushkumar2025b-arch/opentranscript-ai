@@ -1,19 +1,11 @@
 import {
   collection,
-  doc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
   query,
   where,
-  onSnapshot,
-  serverTimestamp,
   getDocs,
-  getDoc,
-  writeBatch,
   limit,
 } from 'firebase/firestore';
-import { db, auth, handleFirestoreError, logFirestoreError, OperationType } from '../firebase';
+import { db, auth, getAuthHeaders, handleFirestoreError, logFirestoreError, OperationType } from '../firebase';
 import { ExactVideoResource } from '../types';
 
 export type ListCategory = 'general' | 'videos' | 'reading' | 'study' | 'favorites';

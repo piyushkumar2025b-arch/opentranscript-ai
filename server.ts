@@ -742,7 +742,7 @@ async function startServer() {
 
       const approxBytes = Math.round((audioBase64.length * 3) / 4);
       if (approxBytes > 25 * 1024 * 1024) {
-        res.status(400).json({ error: 'Uploaded media file exceeds maximum allowed limit of 25 MB.' });
+        res.status(413).json({ error: 'Uploaded media file exceeds maximum allowed limit of 25 MB.' });
         return;
       }
 
@@ -6188,8 +6188,9 @@ Provide 4 to 6 takeaways and 8 to 14 terms.`;
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on port ${PORT}`);
+  const HOST = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
+  app.listen(PORT, HOST, () => {
+    console.log(`Server listening on ${HOST}:${PORT}`);
   });
 }
 

@@ -42,10 +42,10 @@ if ($dbChoice -eq "y") {
     if ($dbOutput -match "database_id\s*=\s*`"([a-f0-9-]+)`"") {
         $databaseId = $matches[1]
         Write-Host "✓ D1 database created with ID: $databaseId" -ForegroundColor Green
-        Write-Host ""
-        Write-Host "IMPORTANT: Update wrangler.toml with this database ID:" -ForegroundColor Yellow
-        Write-Host "  database_id = `"$databaseId`"" -ForegroundColor Cyan
-        Write-Host ""
+        if (Test-Path "wrangler.toml") {
+            (Get-Content "wrangler.toml") -replace 'database_id = ".*"', "database_id = `"$databaseId`"" | Set-Content "wrangler.toml"
+            Write-Host "✓ Automatically updated wrangler.toml with database ID: $databaseId" -ForegroundColor Green
+        }
     } else {
         Write-Host "! Could not extract database ID from output" -ForegroundColor Yellow
         Write-Host "Please check the output above and update wrangler.toml manually" -ForegroundColor Yellow
@@ -87,10 +87,10 @@ if ($kvChoice -eq "y") {
     if ($kvOutput -match "id\s*=\s*`"([a-f0-9]+)`"") {
         $kvId = $matches[1]
         Write-Host "✓ KV namespace created with ID: $kvId" -ForegroundColor Green
-        Write-Host ""
-        Write-Host "IMPORTANT: Update wrangler.toml with this KV namespace ID:" -ForegroundColor Yellow
-        Write-Host "  id = `"$kvId`"" -ForegroundColor Cyan
-        Write-Host ""
+        if (Test-Path "wrangler.toml") {
+            (Get-Content "wrangler.toml") -replace 'id = ".*"', "id = `"$kvId`"" | Set-Content "wrangler.toml"
+            Write-Host "✓ Automatically updated wrangler.toml with KV namespace ID: $kvId" -ForegroundColor Green
+        }
     } else {
         Write-Host "! Could not extract KV ID from output" -ForegroundColor Yellow
         Write-Host "Please check the output above and update wrangler.toml manually" -ForegroundColor Yellow

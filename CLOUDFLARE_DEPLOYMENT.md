@@ -9,7 +9,7 @@ This guide walks you through deploying OpenTranscript AI to Cloudflare Pages wit
    ```bash
    npm install -g wrangler
    ```
-3. **Node.js**: v18 or later
+3. **Node.js**: v20.19+ or v22 LTS (required by Vite 8)
 4. **Git**: For version control
 
 ## Step 1: Install Dependencies

@@ -16,6 +16,7 @@ id = "5c0077a9f7b64297b029e18b34ff9009"
 # Environment variables (non-sensitive only — API keys go via `wrangler pages secret put`)
 [vars]
 ENVIRONMENT = "production"
+APP_URL = "https://opentranscript-ai.pages.dev"
 
 # Local dev settings
 [dev]

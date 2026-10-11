@@ -6,7 +6,7 @@ Complete this checklist to deploy your OpenTranscript AI app to Cloudflare.
 
 - [ ] Cloudflare account created (https://dash.cloudflare.com/sign-up)
 - [ ] Wrangler CLI installed (`npm install -g wrangler`)
-- [ ] Node.js v18+ installed
+- [ ] Node.js v20.19+ or v22 LTS installed (required by Vite 8)
 - [ ] Git repository initialized
 
 ## Step 1: Install Dependencies
