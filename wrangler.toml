@@ -1,11 +1,6 @@
 name = "opentranscript-ai"
-main = "src/worker.ts"
 compatibility_date = "2024-01-01"
 pages_build_output_dir = "./dist"
-
-# Cloudflare Pages configuration
-[site]
-bucket = "./dist"
 
 # D1 Database binding
 [[d1_databases]]
@@ -18,25 +13,11 @@ database_id = "63763c38-3b0c-4504-8eda-26a94e041e62"
 binding = "CACHE"
 id = "5c0077a9f7b64297b029e18b34ff9009"
 
-# R2 bucket for media storage (optional, for uploaded audio/video)
-# [[r2_buckets]]
-# binding = "MEDIA_BUCKET"
-# bucket_name = "opentranscript-media"
-
-# Environment variables (set via wrangler secret or dashboard)
+# Environment variables (non-sensitive only — API keys go via `wrangler pages secret put`)
 [vars]
 ENVIRONMENT = "production"
 
-# Development settings
+# Local dev settings
 [dev]
 port = 8787
 local_protocol = "http"
-
-# Build settings
-[build]
-command = "npm run build:worker"
-
-# Routes for API
-# [[routes]]
-# pattern = "api.yourdomain.com/*"
-# zone_name = "yourdomain.com"
