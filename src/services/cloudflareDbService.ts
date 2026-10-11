@@ -61,6 +61,18 @@ export interface ActivityItem {
 export class CloudflareDbService {
   constructor(private db: D1Database) {}
 
+  // User bootstrap to ensure foreign key constraint is satisfied (F-04)
+  async ensureUserExists(ownerId: string, email?: string, displayName?: string): Promise<void> {
+    await this.db
+      .prepare(`
+        INSERT INTO users (id, email, display_name, created_at, updated_at)
+        VALUES (?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET updated_at = datetime('now')
+      `)
+      .bind(ownerId, email || null, displayName || null)
+      .run();
+  }
+
   // List operations
   async getLists(ownerId: string): Promise<SavedList[]> {
     const result = await this.db
@@ -84,6 +96,7 @@ export class CloudflareDbService {
     description: string,
     category: SavedList['category'] = 'general'
   ): Promise<string> {
+    await this.ensureUserExists(ownerId);
     const id = `list_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     
     await this.db
@@ -168,6 +181,12 @@ export class CloudflareDbService {
       notes?: string;
     }
   ): Promise<string> {
+    // Verify parent list ownership before inserting item (F-03)
+    const parentList = await this.getList(listId, ownerId);
+    if (!parentList) {
+      throw new Error('Parent list not found or unauthorized');
+    }
+    await this.ensureUserExists(ownerId);
     const id = `item_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     await this.db
@@ -258,6 +277,7 @@ export class CloudflareDbService {
       markdown: string;
     }
   ): Promise<string> {
+    await this.ensureUserExists(ownerId);
     const id = `summary_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     await this.db
@@ -309,6 +329,7 @@ export class CloudflareDbService {
       date_key?: string;
     }
   ): Promise<string> {
+    await this.ensureUserExists(ownerId);
     const id = `activity_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     const dateKey = activity.date_key || new Date().toISOString().split('T')[0];
 
@@ -336,6 +357,24 @@ export class CloudflareDbService {
     const result = await this.db
       .prepare('DELETE FROM activity_history WHERE id = ? AND owner_id = ?')
       .bind(activityId, ownerId)
+      .run();
+
+    return result.success;
+  }
+
+  async clearActivityByDate(dateKey: string, ownerId: string): Promise<boolean> {
+    const result = await this.db
+      .prepare('DELETE FROM activity_history WHERE date_key = ? AND owner_id = ?')
+      .bind(dateKey, ownerId)
+      .run();
+
+    return result.success;
+  }
+
+  async clearAllActivity(ownerId: string): Promise<boolean> {
+    const result = await this.db
+      .prepare('DELETE FROM activity_history WHERE owner_id = ?')
+      .bind(ownerId)
       .run();
 
     return result.success;

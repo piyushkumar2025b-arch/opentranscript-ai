@@ -23,16 +23,46 @@ export async function fetchSubtitlesViaYtDlp(
     return null;
   }
 
-  // Determine yt-dlp binary path
-  const localBinary = path.resolve(process.cwd(), 'bin', 'yt-dlp');
-  let binaryPath = 'yt-dlp';
-  try {
-    await fs.access(localBinary);
-    binaryPath = localBinary;
-  } catch {
-    binaryPath = 'yt-dlp';
+  // Determine yt-dlp command candidates (F-15: Windows compatibility & PATH fallback)
+  const isWindows = process.platform === 'win32';
+  const localExe = path.resolve(process.cwd(), 'bin', 'yt-dlp.exe');
+  const localScript = path.resolve(process.cwd(), 'bin', 'yt-dlp');
+
+  interface LaunchCandidate {
+    cmd: string;
+    prefixArgs: string[];
   }
-  try { await fs.chmod(localBinary, 0o755); } catch {}
+
+  const candidates: LaunchCandidate[] = [];
+
+  let hasLocalExe = false;
+  try {
+    await fs.access(localExe);
+    hasLocalExe = true;
+  } catch {}
+
+  let hasLocalScript = false;
+  try {
+    await fs.access(localScript);
+    hasLocalScript = true;
+    try { await fs.chmod(localScript, 0o755); } catch {}
+  } catch {}
+
+  if (hasLocalExe) {
+    candidates.push({ cmd: localExe, prefixArgs: [] });
+  } else if (hasLocalScript) {
+    if (isWindows) {
+      // On Windows, a Unix zipapp/script without .exe cannot be spawned directly by execFile;
+      // try python/py runner first, then PATH yt-dlp
+      candidates.push({ cmd: 'python', prefixArgs: [localScript] });
+      candidates.push({ cmd: 'py', prefixArgs: ['-3', localScript] });
+    } else {
+      candidates.push({ cmd: localScript, prefixArgs: [] });
+    }
+  }
+
+  // Always include system PATH yt-dlp as reliable fallback
+  candidates.push({ cmd: 'yt-dlp', prefixArgs: [] });
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `ytdlp-${videoId}-`));
   const outPattern = path.join(tempDir, `${videoId}.%(ext)s`);
@@ -54,7 +84,7 @@ export async function fetchSubtitlesViaYtDlp(
       }
     }
 
-    const args: string[] = [
+    const baseArgs: string[] = [
       '--skip-download',
       '--write-subs',
       '--write-auto-subs',
@@ -71,33 +101,47 @@ export async function fetchSubtitlesViaYtDlp(
     // Enable node as JavaScript runtime for challenge solving if available
     const nodePath = process.execPath;
     if (nodePath) {
-      args.unshift('--js-runtimes', `node:${nodePath}`);
+      baseArgs.unshift('--js-runtimes', `node:${nodePath}`);
     }
 
     if (tempCookiePath) {
-      args.push('--cookies', tempCookiePath);
+      baseArgs.push('--cookies', tempCookiePath);
     }
 
-    args.push(`https://www.youtube.com/watch?v=${videoId}`);
+    baseArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
 
     const timeout = Math.min(Math.max(options?.timeoutMs || 15000, 5000), 30000);
 
-    await new Promise<void>((resolve) => {
-      execFile(
-        binaryPath,
-        args,
-        {
-          timeout,
-          maxBuffer: 5 * 1024 * 1024,
-        },
-        (_err, _stdout, _stderr) => {
-          // yt-dlp exit with code > 0 is an expected condition when a video has no
-          // public subtitles or requires cookies/sign-in. Do not log "Command failed"
-          // or "ERROR:" to stderr/warn which triggers false-positive error alerts.
-          resolve();
-        }
-      );
-    });
+    for (const candidate of candidates) {
+      const fullArgs = [...candidate.prefixArgs, ...baseArgs];
+      const execResult = await new Promise<{ error: Error | null; spawnFailed: boolean }>((resolve) => {
+        execFile(
+          candidate.cmd,
+          fullArgs,
+          {
+            timeout,
+            maxBuffer: 5 * 1024 * 1024,
+          },
+          (err) => {
+            if (err) {
+              const code = (err as any).code;
+              const isSpawnError = Boolean(
+                ['ENOENT', 'EINVAL', 'EACCES', 'UNKNOWN'].includes(code) ||
+                (err.message && err.message.includes('not a valid Win32 application'))
+              );
+              resolve({ error: err, spawnFailed: isSpawnError });
+            } else {
+              resolve({ error: null, spawnFailed: false });
+            }
+          }
+        );
+      });
+
+      // If spawn was successful (even if exit code > 0 for videos without subtitles), don't try next candidate
+      if (!execResult.spawnFailed) {
+        break;
+      }
+    }
 
     const downloadedFiles = await fs.readdir(tempDir);
     const subFiles = downloadedFiles.filter((f) =>

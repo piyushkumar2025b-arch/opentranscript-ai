@@ -75,7 +75,8 @@ async function startServer() {
   const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || process.env.YOUTUBE_API_KEY || '').trim();
   const GOOGLE_CSE_ID = (process.env.GOOGLE_CSE_ID || '').trim();
 
-  app.use(express.json({ limit: '25mb' }));
+  // Increased from 25mb to 40mb to allow ~33.3MB base64 JSON payload for 25MB decoded audio (F-16)
+  app.use(express.json({ limit: '40mb' }));
 
   // Protective security headers (BUG-007, L-02)
   app.use((_req: Request, res: Response, next: NextFunction) => {

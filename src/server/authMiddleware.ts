@@ -168,15 +168,15 @@ export function requireAuthOrUserKey(req: Request, res: Response, next: NextFunc
     return;
   }
 
-  // In non-production preview / development environment, allow local test calls
+  // In non-production development mode, allow genuine local loopback requests only (F-14)
   if (process.env.NODE_ENV !== 'production') {
-    const host = String(req.headers.host || '').toLowerCase();
-    const isLocalhost =
-      /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ||
-      host.endsWith('.run.app') ||
-      host.endsWith('.aistudio.google.com');
+    const rawHost = String(req.headers.host || '').toLowerCase().trim();
+    const hostname = rawHost.split(':')[0];
+    const remoteIp = req.socket?.remoteAddress;
+    const isLoopbackIp = remoteIp === '127.0.0.1' || remoteIp === '::1' || remoteIp === '::ffff:127.0.0.1';
+    const isExactLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
 
-    if (isLocalhost) {
+    if (isLoopbackIp && isExactLocalhost) {
       next();
       return;
     }

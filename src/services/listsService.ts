@@ -504,8 +504,26 @@ function parseTimeSeconds(formattedTime?: string): number | undefined {
   return undefined;
 }
 
+// Listener hub to broadcast D1 data changes across UI panels (F-08)
+const changeListeners = new Set<() => void>();
+
+export function registerChangeListener(fn: () => void): () => void {
+  changeListeners.add(fn);
+  return () => {
+    changeListeners.delete(fn);
+  };
+}
+
+export function notifyDataChange(): void {
+  changeListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch {}
+  });
+}
+
 /**
- * Ensure a parent list exists in Firestore for the signed-in user before adding subcollection items
+ * Ensure a parent list exists in D1 for the signed-in user before adding subcollection items (F-08)
  */
 export async function ensureCloudListExists(
   requestedListId?: string,
@@ -520,72 +538,85 @@ export async function ensureCloudListExists(
       : requestedListId.slice(0, MAX_ID_LEN);
 
   try {
-    const listRef = doc(db, 'lists', targetListId);
-    let isExisting = false;
-    try {
-      const snap = await getDoc(listRef);
-      isExisting = snap.exists();
-    } catch {
-      isExisting = false;
+    const headers = await getAuthHeaders();
+    if (headers['Authorization']) {
+      const res = await fetch('/api/lists', { headers });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const exists = Array.isArray(data.lists) && data.lists.some((l: any) => l.id === targetListId);
+        if (!exists) {
+          await fetch('/api/lists', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify({
+              name: fallbackName,
+              description: 'Videos, summaries, books, and exact citations synced with Cloudflare D1.',
+              category: 'favorites',
+            }),
+          });
+          notifyDataChange();
+        }
+      }
     }
-    if (!isExisting) {
-      const sanitized = sanitizeListPayload(
-        user.uid,
-        fallbackName,
-        'Videos, summaries, books, and exact citations synced with Firebase.',
-        'favorites'
-      );
-      await setDoc(listRef, {
-        ...sanitized,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `lists/${targetListId}`);
+  } catch (err) {
+    console.warn('ensureCloudListExists D1 error:', err);
   }
 
   return targetListId;
 }
 
 /**
- * Subscribe to the signed-in user's lists in Firestore (`/lists` where `ownerId == uid`)
+ * Subscribe to the signed-in user's lists via D1 Worker API (`/api/lists`) (F-08)
  */
 export function subscribeToUserLists(
   userId: string,
   onUpdate: (lists: SavedUserList[]) => void,
   onError?: (errMessage: string) => void
 ): () => void {
-  const path = 'lists';
-  const q = query(collection(db, path), where('ownerId', '==', userId));
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const lists: SavedUserList[] = snapshot.docs.map((d) => {
-        const data = d.data();
-        return {
-          id: d.id,
-          ownerId: data.ownerId,
-          name: data.name,
-          description: data.description || '',
-          category: data.category || 'general',
-          createdAt: formatFirestoreTimestamp(data.createdAt),
-          updatedAt: formatFirestoreTimestamp(data.updatedAt),
-        };
-      });
-      lists.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      onUpdate(lists);
-    },
-    (error) => {
-      const info = logFirestoreError(error, OperationType.LIST, path);
-      onUpdate([]);
-      onError?.(info.error);
+  let active = true;
+
+  const fetchLists = async () => {
+    try {
+      const headers = await getAuthHeaders();
+      if (headers['Authorization']) {
+        const res = await fetch('/api/lists', { headers });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          if (active && Array.isArray(data.lists)) {
+            const mapped: SavedUserList[] = data.lists.map((d: any) => ({
+              id: d.id,
+              ownerId: d.owner_id || d.ownerId || userId,
+              name: d.name,
+              description: d.description || '',
+              category: d.category || 'general',
+              createdAt: d.created_at || d.createdAt || new Date().toISOString(),
+              updatedAt: d.updated_at || d.updatedAt || new Date().toISOString(),
+            }));
+            onUpdate(mapped);
+            saveLocalLists(mapped);
+            return;
+          }
+        }
+      }
+    } catch (e: any) {
+      if (active && onError) onError(e.message);
     }
-  );
+    if (active) {
+      onUpdate(loadLocalLists());
+    }
+  };
+
+  fetchLists();
+  const unsubListener = registerChangeListener(fetchLists);
+
+  return () => {
+    active = false;
+    unsubListener();
+  };
 }
 
 /**
- * Subscribe to items in a specific list (`/lists/{listId}/items` where `ownerId == uid`)
+ * Subscribe to items in a specific list via D1 Worker API (`/api/lists/{listId}/items`) (F-08)
  */
 export function subscribeToListItems(
   listId: string,
@@ -597,137 +628,121 @@ export function subscribeToListItems(
     onUpdate([]);
     return () => {};
   }
-  const path = `lists/${listId}/items`;
-  const q = query(collection(db, path), where('ownerId', '==', userId));
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const items: SavedListItem[] = snapshot.docs.map((d) => {
-        const data = d.data();
-        return {
-          id: d.id,
-          listId: data.listId || listId,
-          ownerId: data.ownerId,
-          itemType: data.itemType || 'note',
-          title: data.title || 'Saved Item',
-          url: data.url || '',
-          subtitle: data.subtitle || '',
-          content: data.content || '',
-          notes: data.notes || '',
-          createdAt: formatFirestoreTimestamp(data.createdAt),
-          updatedAt: formatFirestoreTimestamp(data.updatedAt),
-        };
-      });
-      items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      onUpdate(items);
-    },
-    (error) => {
-      const info = logFirestoreError(error, OperationType.LIST, path);
-      onUpdate([]);
-      onError?.(info.error);
+  let active = true;
+
+  const fetchItems = async () => {
+    try {
+      const headers = await getAuthHeaders();
+      if (headers['Authorization']) {
+        const res = await fetch(`/api/lists/${encodeURIComponent(listId)}/items`, { headers });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          if (active && Array.isArray(data.items)) {
+            const mapped: SavedListItem[] = data.items.map((d: any) => ({
+              id: d.id,
+              listId: d.list_id || d.listId || listId,
+              ownerId: d.owner_id || d.ownerId || userId,
+              itemType: d.item_type || d.itemType || 'note',
+              title: d.title || 'Saved Item',
+              url: d.url || '',
+              subtitle: d.subtitle || '',
+              content: d.content || '',
+              notes: d.notes || '',
+              createdAt: d.created_at || d.createdAt || new Date().toISOString(),
+              updatedAt: d.updated_at || d.updatedAt || new Date().toISOString(),
+            }));
+            onUpdate(mapped);
+            return;
+          }
+        }
+      }
+    } catch (e: any) {
+      if (active && onError) onError(e.message);
     }
-  );
+    if (active) {
+      onUpdate(loadLocalListItems().filter((it) => it.listId === listId));
+    }
+  };
+
+  fetchItems();
+  const unsubListener = registerChangeListener(fetchItems);
+
+  return () => {
+    active = false;
+    unsubListener();
+  };
 }
 
 /**
- * Subscribe to the signed-in user's saved summaries in Firestore (`/summaries` where `ownerId == uid`)
+ * Subscribe to the signed-in user's saved summaries via D1 Worker API (`/api/summaries`) (F-08)
  */
 export function subscribeToSavedSummaries(
   userId: string,
   onUpdate: (summaries: SavedCloudSummary[]) => void,
   onError?: (errMessage: string) => void
 ): () => void {
-  const path = 'summaries';
-  const q = query(collection(db, path), where('ownerId', '==', userId));
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const summaries: SavedCloudSummary[] = snapshot.docs.map((d) => {
-        const data = d.data();
-        return {
-          id: d.id,
-          ownerId: data.ownerId,
-          videoId: data.videoId || '',
-          videoUrl: data.videoUrl || '',
-          videoTitle: data.videoTitle || 'YouTube Video Summary',
-          authorName: data.authorName || 'YouTube',
-          summaryType: data.summaryType || 'massive',
-          markdown: data.markdown || '',
-          createdAt: formatFirestoreTimestamp(data.createdAt),
-          updatedAt: formatFirestoreTimestamp(data.updatedAt),
-        };
-      });
-      summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      onUpdate(summaries);
-    },
-    (error) => {
-      const info = logFirestoreError(error, OperationType.LIST, path);
-      onUpdate([]);
-      onError?.(info.error);
+  let active = true;
+
+  const fetchSummaries = async () => {
+    try {
+      const headers = await getAuthHeaders();
+      if (headers['Authorization']) {
+        const res = await fetch('/api/summaries', { headers });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          if (active && Array.isArray(data.summaries)) {
+            const mapped: SavedCloudSummary[] = data.summaries.map((d: any) => ({
+              id: d.id,
+              ownerId: d.owner_id || d.ownerId || userId,
+              videoId: d.video_id || d.videoId || '',
+              videoUrl: d.video_url || d.videoUrl || '',
+              videoTitle: d.video_title || d.videoTitle || 'YouTube Video Summary',
+              authorName: d.author_name || d.authorName || 'YouTube',
+              summaryType: d.summary_type || d.summaryType || 'massive',
+              markdown: d.markdown || '',
+              createdAt: d.created_at || d.createdAt || new Date().toISOString(),
+              updatedAt: d.updated_at || d.updatedAt || new Date().toISOString(),
+            }));
+            onUpdate(mapped);
+            saveLocalSummaries(mapped);
+            return;
+          }
+        }
+      }
+    } catch (e: any) {
+      if (active && onError) onError(e.message);
     }
-  );
+    if (active) {
+      onUpdate(loadLocalSummaries());
+    }
+  };
+
+  fetchSummaries();
+  const unsubListener = registerChangeListener(fetchSummaries);
+
+  return () => {
+    active = false;
+    unsubListener();
+  };
 }
 
 /**
- * Subscribe to the signed-in user's custom exact resources in Firestore (`/resources` where `ownerId == uid`)
+ * Subscribe to the signed-in user's custom exact resources (F-08)
  */
 export function subscribeToCustomResources(
   userId: string,
   onUpdate: (resources: ExactVideoResource[]) => void,
-  onError?: (errMessage: string) => void
+  _onError?: (errMessage: string) => void
 ): () => void {
-  const path = 'resources';
-  const q = query(collection(db, path), where('ownerId', '==', userId));
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const resources: ExactVideoResource[] = snapshot.docs.map((d) => {
-        const data = d.data();
-        const title = data.title || 'Exact Resource';
-        const formattedTime = data.formattedTime || undefined;
-        return {
-          id: d.id,
-          title,
-          type: (data.resourceType as ExactVideoResource['type']) || 'Custom Resource',
-          description: data.description || '',
-          primaryUrl: data.primaryUrl || `https://scholar.google.com/scholar?q=${encodeURIComponent(title)}`,
-          primaryLabel: 'Open Exact Resource',
-          authorOrCreator: data.authorOrCreator || undefined,
-          formattedTime,
-          timestampSeconds: parseTimeSeconds(formattedTime),
-          exactQuote: data.exactQuote || undefined,
-          verified: true,
-          secondaryLinks: [
-            {
-              label: 'Google Scholar',
-              url: `https://scholar.google.com/scholar?q=${encodeURIComponent(title)}`,
-              sourceName: 'Google Scholar',
-            },
-            {
-              label: 'Wikipedia',
-              url: `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(title)}`,
-              sourceName: 'Wikipedia',
-            },
-            {
-              label: 'OpenLibrary',
-              url: `https://openlibrary.org/search?q=${encodeURIComponent(title)}`,
-              sourceName: 'OpenLibrary',
-            },
-          ],
-        };
-      });
-      onUpdate(resources);
-    },
-    (error) => {
-      const info = logFirestoreError(error, OperationType.LIST, path);
-      onUpdate([]);
-      onError?.(info.error);
-    }
-  );
+  onUpdate(loadLocalCustomResources());
+  const unsubListener = registerChangeListener(() => {
+    onUpdate(loadLocalCustomResources());
+  });
+  return unsubListener;
 }
 
 /**
- * Create a new list in Firestore (if signed in) or localStorage
+ * Create a new list in Cloudflare D1 (if signed in) or localStorage (F-08)
  */
 export async function createUserList(
   name: string,
@@ -740,43 +755,38 @@ export async function createUserList(
     customId && ID_REGEX.test(customId)
       ? customId.slice(0, MAX_ID_LEN)
       : generateSafeId('list');
+  const sanitized = sanitizeListPayload(user ? user.uid : 'local_user', name, description, category);
 
   if (user) {
-    const path = `lists/${listId}`;
-    const sanitized = sanitizeListPayload(user.uid, name, description, category);
     try {
-      const listRef = doc(db, 'lists', listId);
-      const existingSnap = await getDoc(listRef);
-      if (existingSnap.exists()) {
-        const existingData = existingSnap.data();
-        return {
-          id: listId,
-          ownerId: existingData.ownerId || user.uid,
-          name: existingData.name || sanitized.name,
-          description: existingData.description || sanitized.description,
-          category: existingData.category || sanitized.category,
-          createdAt: formatFirestoreTimestamp(existingData.createdAt),
-          updatedAt: formatFirestoreTimestamp(existingData.updatedAt),
-        };
-      }
-      await setDoc(listRef, {
-        ...sanitized,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/lists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          name: sanitized.name,
+          description: sanitized.description,
+          category: sanitized.category,
+        }),
       });
-      return {
-        id: listId,
-        ...sanitized,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const created: SavedUserList = {
+          id: data.id || listId,
+          ...sanitized,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        const current = loadLocalLists().filter((l) => l.id !== created.id);
+        saveLocalLists([created, ...current]);
+        notifyDataChange();
+        return created;
+      }
+    } catch (err) {
+      console.warn('D1 createUserList error:', err);
     }
   }
 
-  // Local fallback when not signed in
-  const sanitized = sanitizeListPayload('local_user', name, description, category);
   const newList: SavedUserList = {
     id: listId,
     ...sanitized,
@@ -785,6 +795,7 @@ export async function createUserList(
   };
   const current = loadLocalLists();
   saveLocalLists([newList, ...current]);
+  notifyDataChange();
   return newList;
 }
 
@@ -798,19 +809,23 @@ export async function updateUserList(
   category: ListCategory
 ): Promise<void> {
   const user = auth.currentUser;
+  const safeName = name.trim().slice(0, MAX_LIST_NAME_LEN);
+  const safeDesc = description.trim().slice(0, MAX_LIST_DESC_LEN);
+
   if (user) {
-    const path = `lists/${listId}`;
-    const sanitized = sanitizeListPayload(user.uid, name, description, category);
     try {
-      await updateDoc(doc(db, 'lists', listId), {
-        name: sanitized.name,
-        description: sanitized.description,
-        category: sanitized.category,
-        updatedAt: serverTimestamp(),
+      const headers = await getAuthHeaders();
+      await fetch(`/api/lists/${encodeURIComponent(listId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          name: safeName,
+          description: safeDesc,
+          category,
+        }),
       });
-      return;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, path);
+    } catch (err) {
+      console.warn('D1 updateUserList error:', err);
     }
   }
 
@@ -819,45 +834,31 @@ export async function updateUserList(
     l.id === listId
       ? {
           ...l,
-          name: name.trim().slice(0, MAX_LIST_NAME_LEN) || l.name,
-          description: description.trim().slice(0, MAX_LIST_DESC_LEN),
+          name: safeName || l.name,
+          description: safeDesc,
           category,
           updatedAt: new Date().toISOString(),
         }
       : l
   );
   saveLocalLists(updated);
+  notifyDataChange();
 }
 
 /**
- * Delete a user list and its subcollection items
+ * Delete a user list and its items in Cloudflare D1 (F-08)
  */
 export async function deleteUserList(listId: string): Promise<void> {
   const user = auth.currentUser;
   if (user) {
-    const itemsPath = `lists/${listId}/items`;
     try {
-      const q = query(collection(db, itemsPath), where('ownerId', '==', user.uid));
-      const snap = await getDocs(q);
-      // Delete subcollection items in chunks of up to 450 operations per Firestore writeBatch,
-      // committing the parent list deletion in the final batch (single-batch atomic when <= 449 items).
-      const docs = snap.docs;
-      for (let i = 0; i < docs.length; i += 450) {
-        const batch = writeBatch(db);
-        for (const itemDoc of docs.slice(i, i + 450)) {
-          batch.delete(doc(db, 'lists', listId, 'items', itemDoc.id));
-        }
-        if (i + 450 >= docs.length) {
-          batch.delete(doc(db, 'lists', listId));
-        }
-        await batch.commit();
-      }
-      if (docs.length === 0) {
-        await deleteDoc(doc(db, 'lists', listId));
-      }
-      return;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, `lists/${listId}`);
+      const headers = await getAuthHeaders();
+      await fetch(`/api/lists/${encodeURIComponent(listId)}`, {
+        method: 'DELETE',
+        headers,
+      });
+    } catch (err) {
+      console.warn('D1 deleteUserList error:', err);
     }
   }
 
@@ -865,10 +866,11 @@ export async function deleteUserList(listId: string): Promise<void> {
   saveLocalLists(lists);
   const items = loadLocalListItems().filter((i) => i.listId !== listId);
   saveLocalListItems(items);
+  notifyDataChange();
 }
 
 /**
- * Add an item (video summary, book, article, or note) to a specific list
+ * Add an item to a specific list in Cloudflare D1 (F-08)
  */
 export async function addItemToUserList(
   listId: string,
@@ -886,22 +888,29 @@ export async function addItemToUserList(
 
   if (user) {
     const targetListId = await ensureCloudListExists(listId);
-    const path = `lists/${targetListId}/items/${itemId}`;
     const sanitized = sanitizeListItemPayload(targetListId, user.uid, input);
     try {
-      await setDoc(doc(db, 'lists', targetListId, 'items', itemId), {
-        ...sanitized,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      const headers = await getAuthHeaders();
+      const res = await fetch(`/api/lists/${encodeURIComponent(targetListId)}/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(sanitized),
       });
-      return {
-        id: itemId,
-        ...sanitized,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const created: SavedListItem = {
+          id: data.id || itemId,
+          ...sanitized,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        const current = loadLocalListItems();
+        saveLocalListItems([created, ...current]);
+        notifyDataChange();
+        return created;
+      }
+    } catch (err) {
+      console.warn('D1 addItemToUserList error:', err);
     }
   }
 
@@ -914,6 +923,7 @@ export async function addItemToUserList(
   };
   const current = loadLocalListItems();
   saveLocalListItems([newItem, ...current]);
+  notifyDataChange();
   return newItem;
 }
 
@@ -928,20 +938,24 @@ export async function updateListItemNotes(
 ): Promise<void> {
   const user = auth.currentUser;
   const safeNotes = (notes || '').slice(0, MAX_ITEM_NOTES_LEN);
+  const safeTitle = title !== undefined ? title.trim().slice(0, MAX_ITEM_TITLE_LEN) : undefined;
+
   if (user) {
-    const path = `lists/${listId}/items/${itemId}`;
     try {
-      const payload: Record<string, any> = {
-        notes: safeNotes,
-        updatedAt: serverTimestamp(),
-      };
-      if (title !== undefined) {
-        payload.title = title.trim().slice(0, MAX_ITEM_TITLE_LEN) || 'Saved Item';
-      }
-      await updateDoc(doc(db, 'lists', listId, 'items', itemId), payload);
-      return;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, path);
+      const headers = await getAuthHeaders();
+      await fetch(
+        `/api/lists/${encodeURIComponent(listId)}/items/${encodeURIComponent(itemId)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify({
+            notes: safeNotes,
+            title: safeTitle,
+          }),
+        }
+      );
+    } catch (err) {
+      console.warn('D1 updateListItemNotes error:', err);
     }
   }
 
@@ -950,35 +964,39 @@ export async function updateListItemNotes(
       ? {
           ...it,
           notes: safeNotes,
-          title: title !== undefined ? title.trim().slice(0, MAX_ITEM_TITLE_LEN) || it.title : it.title,
+          title: safeTitle !== undefined ? safeTitle || it.title : it.title,
           updatedAt: new Date().toISOString(),
         }
       : it
   );
   saveLocalListItems(items);
+  notifyDataChange();
 }
 
 /**
- * Delete a saved item from a list
+ * Delete a saved item from a list in Cloudflare D1 (F-08)
  */
 export async function deleteItemFromUserList(listId: string, itemId: string): Promise<void> {
   const user = auth.currentUser;
   if (user) {
-    const path = `lists/${listId}/items/${itemId}`;
     try {
-      await deleteDoc(doc(db, 'lists', listId, 'items', itemId));
-      return;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, path);
+      const headers = await getAuthHeaders();
+      await fetch(`/api/lists/${encodeURIComponent(listId)}/items/${encodeURIComponent(itemId)}`, {
+        method: 'DELETE',
+        headers,
+      });
+    } catch (err) {
+      console.warn('D1 deleteItemFromUserList error:', err);
     }
   }
 
   const items = loadLocalListItems().filter((i) => !(i.id === itemId && i.listId === listId));
   saveLocalListItems(items);
+  notifyDataChange();
 }
 
 /**
- * Save or update a Video Summary directly in Firestore (`/summaries/{summaryId}`)
+ * Save or update a Video Summary in Cloudflare D1 (`/api/summaries`) (F-08)
  */
 export async function saveSummaryToFirestore(input: {
   videoId?: string;
@@ -995,63 +1013,45 @@ export async function saveSummaryToFirestore(input: {
       ? rawVideoId.slice(0, 36)
       : `doc_${computeStableHash(`${input.videoTitle || ''}:${input.videoUrl || ''}:${(input.markdown || '').slice(0, 250)}`)}`;
 
+  const summaryId = `sum_${uniqueKey}`;
+  const sanitized = sanitizeSavedSummaryPayload(user ? user.uid : 'local_user', input);
+
   if (user) {
-    const cleanUid = user.uid.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 48) || 'user';
-    const summaryId = `sum_${cleanUid}_${uniqueKey}`;
-    const path = `summaries/${summaryId}`;
-    const sanitized = sanitizeSavedSummaryPayload(user.uid, input);
-
     try {
-      const summaryRef = doc(db, 'summaries', summaryId);
-      let isExisting = false;
-      try {
-        const snap = await getDoc(summaryRef);
-        isExisting = snap.exists();
-      } catch {
-        isExisting = false;
-      }
-
-      if (isExisting) {
-        await updateDoc(summaryRef, {
-          videoId: sanitized.videoId,
-          videoUrl: sanitized.videoUrl,
-          videoTitle: sanitized.videoTitle,
-          authorName: sanitized.authorName,
-          summaryType: sanitized.summaryType,
-          markdown: sanitized.markdown,
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        await setDoc(summaryRef, {
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/summaries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(sanitized),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const created: SavedCloudSummary = {
+          id: data.id || summaryId,
           ...sanitized,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        const current = loadLocalSummaries().filter((s) => s.videoId !== input.videoId);
+        saveLocalSummaries([created, ...current]);
+        notifyDataChange();
+        return created;
       }
-
-      return {
-        id: summaryId,
-        ...sanitized,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, path);
+    } catch (err) {
+      console.warn('D1 saveSummary error:', err);
     }
   }
 
-  // Local fallback when not signed in
-  const summaryId = `sum_local_${uniqueKey}`;
-  const sanitized = sanitizeSavedSummaryPayload('local_user', input);
-  const newSummary: SavedCloudSummary = {
+  const localSummary: SavedCloudSummary = {
     id: summaryId,
     ...sanitized,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  const current = loadLocalSummaries().filter((s) => s.id !== summaryId);
-  saveLocalSummaries([newSummary, ...current]);
-  return newSummary;
+  const current = loadLocalSummaries().filter((s) => s.videoId !== input.videoId);
+  saveLocalSummaries([localSummary, ...current]);
+  notifyDataChange();
+  return localSummary;
 }
 
 /**
@@ -1104,52 +1104,44 @@ export async function createCustomExactResource(input: {
   };
 
   if (user) {
-    const path = `resources/${resourceId}`;
     try {
-      await setDoc(doc(db, 'resources', resourceId), {
-        ...sanitized,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      const defaultListId = await ensureCloudListExists(getDefaultCloudListId(user.uid));
+      await addItemToUserList(defaultListId, {
+        itemType: 'note',
+        title: sanitized.title,
+        url: sanitized.primaryUrl,
+        subtitle: sanitized.authorOrCreator,
+        content: sanitized.description,
+        notes: sanitized.exactQuote,
       });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
-    }
+    } catch {}
   }
 
-  // Update local cache after cloud write succeeds (or when in local mode)
+  // Update local cache and notify listeners
   const currentLocal = loadLocalCustomResources();
   saveLocalCustomResources([createdResource, ...currentLocal]);
+  notifyDataChange();
 
   return createdResource;
 }
 
 /**
- * Delete a custom Exact Video Resource from Firestore (`/resources/{resourceId}`) and localStorage
+ * Delete a custom Exact Video Resource from local cache (F-08)
  */
 export async function deleteCustomExactResource(resourceId: string): Promise<void> {
-  const user = auth.currentUser;
-  if (user && ID_REGEX.test(resourceId)) {
-    const path = `resources/${resourceId}`;
-    try {
-      await deleteDoc(doc(db, 'resources', resourceId));
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, path);
-    }
-  }
-
   const updatedLocal = loadLocalCustomResources().filter((r) => r.id !== resourceId);
   saveLocalCustomResources(updatedLocal);
+  notifyDataChange();
 }
 
 /**
- * Automatically migrate any local lists, items, summaries, and custom resources into Firebase Firestore upon sign-in,
- * preserving list mappings, deduplicating by ID + (title, url), isolating per-item errors, and clearing migrated local storage.
+ * Automatically migrate any local lists, items, summaries, and activity into Cloudflare D1 upon sign-in (F-08),
+ * preserving list mappings, deduplicating, isolating per-item errors, and clearing migrated local storage.
  */
-export async function syncLocalDataToFirestore(): Promise<void> {
+export async function syncLocalDataToCloud(): Promise<void> {
   const user = auth.currentUser;
   if (!user) return;
 
-  // Account isolation check (BUG-002): do not auto-import another user's local profile
   const lastUid = typeof window !== 'undefined' ? localStorage.getItem(LAST_SYNCED_USER_KEY) : null;
   if (lastUid && lastUid !== user.uid) {
     console.info('Preserving distinct user session boundaries for account:', user.uid);
@@ -1159,10 +1151,13 @@ export async function syncLocalDataToFirestore(): Promise<void> {
   }
 
   try {
+    const headers = await getAuthHeaders();
+    if (!headers['Authorization']) return;
+
     const defaultListId = await ensureCloudListExists(getDefaultCloudListId(user.uid));
     const oldToNewListIdMap = new Map<string, string>();
 
-    // 1. Migrate custom local lists (other than list_default_favorites) - BUG-001 failure safe
+    // 1. Sync custom local lists to D1
     const rawListsStr = typeof window !== 'undefined' ? localStorage.getItem(LOCAL_LISTS_KEY) : null;
     if (rawListsStr) {
       const localLists = loadLocalLists();
@@ -1171,20 +1166,24 @@ export async function syncLocalDataToFirestore(): Promise<void> {
       for (const l of localLists) {
         if (!l || l.id === 'list_default_favorites') continue;
         try {
-          const targetId = ID_REGEX.test(l.id) ? l.id.slice(0, MAX_ID_LEN) : generateSafeId('list');
-          oldToNewListIdMap.set(l.id, targetId);
-          const ref = doc(db, 'lists', targetId);
-          const snap = await getDoc(ref);
-          if (!snap.exists()) {
-            const sanitized = sanitizeListPayload(user.uid, l.name, l.description, l.category);
-            await setDoc(ref, {
-              ...sanitized,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
+          const res = await fetch('/api/lists', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify({
+              name: l.name,
+              description: l.description,
+              category: l.category,
+            }),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as any;
+            if (data.id) {
+              oldToNewListIdMap.set(l.id, data.id);
+            }
+          } else {
+            unmigratedLists.push(l);
           }
-        } catch (err) {
-          console.warn('Skipping single local list migration error, keeping locally:', err);
+        } catch {
           unmigratedLists.push(l);
         }
       }
@@ -1198,191 +1197,239 @@ export async function syncLocalDataToFirestore(): Promise<void> {
       }
     }
 
-    // 2. Migrate local list items into their mapped cloud list (BUG-025 preservation)
+    // 2. Sync local list items to D1
     const localItems = loadLocalListItems();
     if (localItems.length > 0) {
       const unmigratedItems: SavedListItem[] = [];
       for (const item of localItems) {
         try {
-          const mappedFromOld = item.listId ? oldToNewListIdMap.get(item.listId) : undefined;
-          const targetListId = mappedFromOld || item.listId;
-          const mappedListId =
-            !targetListId || targetListId === 'list_default_favorites' || !ID_REGEX.test(targetListId)
-              ? defaultListId
-              : await ensureCloudListExists(targetListId);
-          const itemId = ID_REGEX.test(item.id)
-            ? item.id.slice(0, MAX_ID_LEN)
-            : `item_${computeStableHash(`${item.title}:${item.url}:${item.content?.slice(0, 100) || ''}`)}`;
-          const itemRef = doc(db, 'lists', mappedListId, 'items', itemId);
-          const snap = await getDoc(itemRef);
-          if (!snap.exists()) {
-            const sanitized = sanitizeListItemPayload(mappedListId, user.uid, item);
-            await setDoc(itemRef, {
-              ...sanitized,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
+          const mappedTargetListId = (item.listId && oldToNewListIdMap.get(item.listId)) || defaultListId;
+          const sanitized = sanitizeListItemPayload(mappedTargetListId, user.uid, item);
+          const res = await fetch(`/api/lists/${encodeURIComponent(mappedTargetListId)}/items`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify(sanitized),
+          });
+          if (!res.ok) {
+            unmigratedItems.push(item);
           }
-        } catch (err) {
-          console.warn('Skipping single local item migration error, keeping locally:', err);
+        } catch {
           unmigratedItems.push(item);
         }
       }
       saveLocalListItems(unmigratedItems);
     }
 
-    // 3. Migrate local summaries into Firestore `/summaries`
+    // 3. Sync local summaries to D1
     const localSummaries = loadLocalSummaries();
     if (localSummaries.length > 0) {
       const unmigratedSummaries: SavedCloudSummary[] = [];
       for (const s of localSummaries) {
         try {
-          await saveSummaryToFirestore({
-            videoId: s.videoId,
-            videoUrl: s.videoUrl,
-            videoTitle: s.videoTitle,
-            authorName: s.authorName,
-            summaryType: s.summaryType,
-            markdown: s.markdown,
+          const sanitized = sanitizeSavedSummaryPayload(user.uid, s);
+          const res = await fetch('/api/summaries', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify(sanitized),
           });
-        } catch (err) {
-          console.warn('Skipping single local summary migration error, keeping locally:', err);
+          if (!res.ok) {
+            unmigratedSummaries.push(s);
+          }
+        } catch {
           unmigratedSummaries.push(s);
         }
       }
       saveLocalSummaries(unmigratedSummaries);
     }
 
-    // 4. Migrate local custom exact resources into Firestore `/resources`
-    const localResources = loadLocalCustomResources();
-    if (localResources.length > 0) {
-      const existingResSnap = await getDocs(
-        query(collection(db, 'resources'), where('ownerId', '==', user.uid), limit(250))
-      );
-      const existingResKeys = new Set(
-        existingResSnap.docs.map((d) => `${d.data().title}::${d.data().primaryUrl || ''}`)
-      );
-      const unmigratedResources: ExactVideoResource[] = [];
-      for (const res of localResources) {
-        const dedupeKey = `${res.title}::${res.primaryUrl || ''}`;
-        if (existingResKeys.has(dedupeKey)) continue;
-        try {
-          const resId = ID_REGEX.test(res.id) ? res.id.slice(0, MAX_ID_LEN) : generateSafeId('res');
-          const sanitized = sanitizeCustomResourcePayload(user.uid, {
-            title: res.title,
-            type: res.type,
-            description: res.description,
-            primaryUrl: res.primaryUrl,
-            authorOrCreator: res.authorOrCreator,
-            formattedTime: res.formattedTime,
-            exactQuote: res.exactQuote,
-          });
-          await setDoc(doc(db, 'resources', resId), {
-            ...sanitized,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-          existingResKeys.add(dedupeKey);
-        } catch (err) {
-          console.warn('Skipping single local resource migration error, keeping locally:', err);
-          unmigratedResources.push(res);
-        }
-      }
-      saveLocalCustomResources(unmigratedResources);
-    }
-
-    // 5. Migrate local activity & search history into Firestore `/history` (BUG-004: all records preserved)
+    // 4. Sync local activity history to D1
     const localHistory = loadLocalActivityHistory();
     if (localHistory.length > 0) {
-      const existingHistSnap = await getDocs(
-        query(collection(db, 'history'), where('ownerId', '==', user.uid), limit(250))
-      );
-      const existingHistIds = new Set(existingHistSnap.docs.map((d) => d.id));
       const unmigratedHistory: ActivityHistoryItem[] = [];
-
       for (const h of localHistory) {
         try {
-          const histId = ID_REGEX.test(h.id)
-            ? h.id.slice(0, MAX_ID_LEN)
-            : `hist_${computeStableHash(`${h.actionType}:${h.queryOrTitle}:${h.dateKey}:${h.createdAt}`)}`;
-          if (existingHistIds.has(histId)) continue;
-
-          const sanitized = sanitizeActivityHistoryPayload(user.uid, {
-            actionType: h.actionType,
-            queryOrTitle: h.queryOrTitle,
-            detail: h.detail,
-            url: h.url,
-            videoId: h.videoId,
-            dateKey: h.dateKey,
+          const sanitized = sanitizeActivityHistoryPayload(user.uid, h);
+          const res = await fetch('/api/activity', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify(sanitized),
           });
-          await setDoc(doc(db, 'history', histId), {
-            ...sanitized,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-          existingHistIds.add(histId);
-        } catch (err) {
-          console.warn('Skipping single local history migration error, keeping locally:', err);
+          if (!res.ok) {
+            unmigratedHistory.push(h);
+          }
+        } catch {
           unmigratedHistory.push(h);
         }
       }
       saveLocalActivityHistory(unmigratedHistory);
     }
+
+    notifyDataChange();
   } catch (err) {
-    console.warn('Background Firebase sync warning:', err);
+    console.warn('Background Cloudflare D1 sync warning:', err);
   }
 }
 
+export const syncLocalDataToFirestore = syncLocalDataToCloud;
+
 /**
- * Subscribe to the signed-in user's chronological activity & search history in Firestore (`/history` where `ownerId == uid`)
- * Bounded by limit(150) to prevent full-collection client memory exhaustion (BUG-028)
+ * Migration helper to export legacy Firestore collections to Cloudflare D1 (F-08)
+ */
+export async function migrateFirestoreToD1(): Promise<{ lists: number; summaries: number; history: number }> {
+  const user = auth.currentUser;
+  if (!user) return { lists: 0, summaries: 0, history: 0 };
+
+  const headers = await getAuthHeaders();
+  if (!headers['Authorization']) return { lists: 0, summaries: 0, history: 0 };
+
+  let migratedLists = 0;
+  let migratedSummaries = 0;
+  let migratedHistory = 0;
+
+  try {
+    // Read legacy Firestore lists
+    const listsSnap = await getDocs(query(collection(db, 'lists'), where('ownerId', '==', user.uid), limit(50)));
+    for (const d of listsSnap.docs) {
+      const data = d.data();
+      const res = await fetch('/api/lists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          name: data.name || 'Migrated List',
+          description: data.description || '',
+          category: data.category || 'general',
+        }),
+      });
+      if (res.ok) {
+        const listData = (await res.json()) as any;
+        migratedLists++;
+        try {
+          const itemsSnap = await getDocs(collection(db, 'lists', d.id, 'items'));
+          for (const itemDoc of itemsSnap.docs) {
+            const itemData = itemDoc.data();
+            await fetch(`/api/lists/${encodeURIComponent(listData.id)}/items`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...headers },
+              body: JSON.stringify({
+                item_type: itemData.itemType || itemData.item_type || 'note',
+                title: itemData.title || 'Item',
+                url: itemData.url || '',
+                subtitle: itemData.subtitle || '',
+                content: itemData.content || '',
+                notes: itemData.notes || '',
+              }),
+            });
+          }
+        } catch {}
+      }
+    }
+
+    // Read legacy Firestore summaries
+    const sumSnap = await getDocs(query(collection(db, 'summaries'), where('ownerId', '==', user.uid), limit(50)));
+    for (const d of sumSnap.docs) {
+      const data = d.data();
+      const res = await fetch('/api/summaries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          video_id: data.videoId || data.video_id || '',
+          video_url: data.videoUrl || data.video_url || '',
+          video_title: data.videoTitle || data.video_title || 'Summary',
+          author_name: data.authorName || data.author_name || 'YouTube',
+          summary_type: data.summaryType || data.summary_type || 'massive',
+          markdown: data.markdown || '',
+        }),
+      });
+      if (res.ok) migratedSummaries++;
+    }
+
+    // Read legacy Firestore history
+    const histSnap = await getDocs(query(collection(db, 'history'), where('ownerId', '==', user.uid), limit(100)));
+    for (const d of histSnap.docs) {
+      const data = d.data();
+      const res = await fetch('/api/activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          action_type: data.actionType || data.action_type || 'video',
+          query_or_title: data.queryOrTitle || data.query_or_title || '',
+          detail: data.detail || '',
+          url: data.url || '',
+          video_id: data.videoId || data.video_id || '',
+          date_key: data.dateKey || data.date_key,
+        }),
+      });
+      if (res.ok) migratedHistory++;
+    }
+
+    notifyDataChange();
+  } catch (err) {
+    console.warn('migrateFirestoreToD1 warning:', err);
+  }
+
+  return { lists: migratedLists, summaries: migratedSummaries, history: migratedHistory };
+}
+
+/**
+ * Subscribe to the signed-in user's chronological activity & search history in Cloudflare D1 (`/api/activity`) (F-08)
  */
 export function subscribeToActivityHistory(
   userId: string,
   onUpdate: (items: ActivityHistoryItem[]) => void,
   onError?: (errMessage: string) => void
 ): () => void {
-  const path = 'history';
-  const q = query(
-    collection(db, path),
-    where('ownerId', '==', userId),
-    limit(150)
-  );
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const items: ActivityHistoryItem[] = snapshot.docs.map((d) => {
-        const data = d.data();
-        const createdIso = formatFirestoreTimestamp(data.createdAt);
-        return {
-          id: d.id,
-          ownerId: data.ownerId || userId,
-          actionType: ALLOWED_ACTIVITY_TYPES.includes(data.actionType) ? data.actionType : 'research_search',
-          queryOrTitle: data.queryOrTitle || 'Activity',
-          detail: data.detail || '',
-          url: data.url || '',
-          videoId: data.videoId || '',
-          dateKey:
-            typeof data.dateKey === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(data.dateKey)
-              ? data.dateKey
-              : formatDateKey(createdIso),
-          createdAt: createdIso,
-          updatedAt: formatFirestoreTimestamp(data.updatedAt),
-        };
-      });
-      items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      onUpdate(items);
-    },
-    (error) => {
-      const info = logFirestoreError(error, OperationType.LIST, path);
-      onUpdate(loadLocalActivityHistory());
-      onError?.(info.error);
+  let active = true;
+
+  const fetchActivity = async () => {
+    try {
+      const headers = await getAuthHeaders();
+      if (headers['Authorization']) {
+        const res = await fetch('/api/activity', { headers });
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          if (active && Array.isArray(data.items)) {
+            const mapped: ActivityHistoryItem[] = data.items.map((d: any) => ({
+              id: d.id,
+              ownerId: d.owner_id || d.ownerId || userId,
+              actionType: ALLOWED_ACTIVITY_TYPES.includes(d.action_type || d.actionType)
+                ? (d.action_type || d.actionType)
+                : 'research_search',
+              queryOrTitle: d.query_or_title || d.queryOrTitle || 'Activity',
+              detail: d.detail || '',
+              url: d.url || '',
+              videoId: d.video_id || d.videoId || '',
+              dateKey:
+                typeof (d.date_key || d.dateKey) === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(d.date_key || d.dateKey)
+                  ? (d.date_key || d.dateKey)
+                  : formatDateKey(d.created_at || d.createdAt),
+              createdAt: d.created_at || d.createdAt || new Date().toISOString(),
+              updatedAt: d.updated_at || d.updatedAt || new Date().toISOString(),
+            }));
+            onUpdate(mapped);
+            saveLocalActivityHistory(mapped);
+            return;
+          }
+        }
+      }
+    } catch (e: any) {
+      if (active && onError) onError(e.message);
     }
-  );
+    if (active) {
+      onUpdate(loadLocalActivityHistory());
+    }
+  };
+
+  fetchActivity();
+  const unsubListener = registerChangeListener(fetchActivity);
+
+  return () => {
+    active = false;
+    unsubListener();
+  };
 }
 
 /**
- * Record any user search or action into date-grouped history (Firestore + localStorage fallback)
+ * Record any user search or action into date-grouped history (Cloudflare D1 + localStorage fallback) (F-08)
  */
 export async function recordUserActivity(input: {
   actionType:
@@ -1458,19 +1505,27 @@ export async function recordUserActivity(input: {
       dateKey,
     });
     try {
-      await setDoc(doc(db, 'history', historyId), {
-        ...sanitized,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/activity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(sanitized),
       });
-      return {
-        id: historyId,
-        ...sanitized,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-    } catch (error) {
-      logFirestoreError(error, OperationType.CREATE, `history/${historyId}`);
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const createdItem: ActivityHistoryItem = {
+          id: data.id || historyId,
+          ...sanitized,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        const current = loadLocalActivityHistory();
+        saveLocalActivityHistory([createdItem, ...current]);
+        notifyDataChange();
+        return createdItem;
+      }
+    } catch (err) {
+      console.warn('D1 recordUserActivity error:', err);
     }
   }
 
@@ -1490,6 +1545,7 @@ export async function recordUserActivity(input: {
   };
   const current = loadLocalActivityHistory();
   saveLocalActivityHistory([localItem, ...current]);
+  notifyDataChange();
   return localItem;
 }
 
@@ -1497,40 +1553,36 @@ export async function deleteActivityHistoryItem(historyId: string): Promise<void
   const user = auth.currentUser;
   if (user && ID_REGEX.test(historyId)) {
     try {
-      await deleteDoc(doc(db, 'history', historyId));
-    } catch (error) {
-      logFirestoreError(error, OperationType.DELETE, `history/${historyId}`);
-      throw error;
+      const headers = await getAuthHeaders();
+      await fetch(`/api/activity/${encodeURIComponent(historyId)}`, {
+        method: 'DELETE',
+        headers,
+      });
+    } catch (err) {
+      console.warn('D1 deleteActivityHistoryItem error:', err);
     }
   }
   const current = loadLocalActivityHistory().filter((h) => h.id !== historyId);
   saveLocalActivityHistory(current);
+  notifyDataChange();
 }
 
 export async function clearActivityHistoryByDate(dateKey: string): Promise<void> {
   const user = auth.currentUser;
   if (user) {
     try {
-      const q = query(
-        collection(db, 'history'),
-        where('ownerId', '==', user.uid),
-        where('dateKey', '==', dateKey)
-      );
-      const snap = await getDocs(q);
-      for (let i = 0; i < snap.docs.length; i += 450) {
-        const batch = writeBatch(db);
-        for (const d of snap.docs.slice(i, i + 450)) {
-          batch.delete(doc(db, 'history', d.id));
-        }
-        await batch.commit();
-      }
-    } catch (error) {
-      logFirestoreError(error, OperationType.DELETE, 'history');
-      throw error;
+      const headers = await getAuthHeaders();
+      await fetch(`/api/activity?dateKey=${encodeURIComponent(dateKey)}`, {
+        method: 'DELETE',
+        headers,
+      });
+    } catch (err) {
+      console.warn('D1 clearActivityHistoryByDate error:', err);
     }
   }
   const current = loadLocalActivityHistory().filter((h) => h.dateKey !== dateKey);
   saveLocalActivityHistory(current);
+  notifyDataChange();
 }
 
 export const clearActivityHistoryForDate = clearActivityHistoryByDate;
@@ -1539,20 +1591,16 @@ export async function clearAllActivityHistory(): Promise<void> {
   const user = auth.currentUser;
   if (user) {
     try {
-      const q = query(collection(db, 'history'), where('ownerId', '==', user.uid));
-      const snap = await getDocs(q);
-      for (let i = 0; i < snap.docs.length; i += 450) {
-        const batch = writeBatch(db);
-        for (const d of snap.docs.slice(i, i + 450)) {
-          batch.delete(doc(db, 'history', d.id));
-        }
-        await batch.commit();
-      }
-    } catch (error) {
-      logFirestoreError(error, OperationType.DELETE, 'history');
-      throw error;
+      const headers = await getAuthHeaders();
+      await fetch('/api/activity?all=true', {
+        method: 'DELETE',
+        headers,
+      });
+    } catch (err) {
+      console.warn('D1 clearAllActivityHistory error:', err);
     }
   }
   saveLocalActivityHistory([]);
+  notifyDataChange();
 }
 

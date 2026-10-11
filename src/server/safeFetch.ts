@@ -158,6 +158,7 @@ export async function safeFetch(
 
   let currentUrl = initialUrl;
   let redirectsCount = 0;
+  let currentHeaders: HeadersInit | undefined = headers;
 
   while (true) {
     const isSafe = await isSafePublicUrl(currentUrl, allowedHosts);
@@ -171,7 +172,7 @@ export async function safeFetch(
     try {
       const res = await fetch(currentUrl, {
         ...fetchRest,
-        headers,
+        headers: currentHeaders,
         redirect: 'manual',
         signal: controller.signal,
       });
@@ -193,24 +194,37 @@ export async function safeFetch(
         const nextUrlObj = new URL(location, currentUrl);
         const prevUrlObj = new URL(currentUrl);
 
-        // Strip sensitive credentials/headers when crossing origins (H-05)
-        if (nextUrlObj.origin !== prevUrlObj.origin && headers) {
+        // Strip sensitive credentials/headers when crossing origins (H-05, F-10)
+        if (nextUrlObj.origin !== prevUrlObj.origin && currentHeaders) {
+          const SENSITIVE_HEADERS = new Set([
+            'authorization',
+            'cookie',
+            'x-openrouter-key',
+            'x-user-key',
+            'x-youtube-api-key',
+            'x-youtube-cookies',
+          ]);
           const sanitizedHeaders: Record<string, string> = {};
-          if (headers instanceof Headers) {
-            headers.forEach((val, key) => {
-              const lower = key.toLowerCase();
-              if (!['authorization', 'cookie', 'x-openrouter-key', 'x-user-key', 'x-youtube-api-key', 'x-youtube-cookies'].includes(lower)) {
+          if (currentHeaders instanceof Headers) {
+            currentHeaders.forEach((val, key) => {
+              if (!SENSITIVE_HEADERS.has(key.toLowerCase())) {
                 sanitizedHeaders[key] = val;
               }
             });
-          } else if (typeof headers === 'object') {
-            for (const [k, v] of Object.entries(headers)) {
-              const lower = k.toLowerCase();
-              if (!['authorization', 'cookie', 'x-openrouter-key', 'x-user-key', 'x-youtube-api-key', 'x-youtube-cookies'].includes(lower)) {
+          } else if (Array.isArray(currentHeaders)) {
+            for (const [k, v] of currentHeaders) {
+              if (!SENSITIVE_HEADERS.has(k.toLowerCase())) {
+                sanitizedHeaders[k] = String(v);
+              }
+            }
+          } else if (typeof currentHeaders === 'object') {
+            for (const [k, v] of Object.entries(currentHeaders)) {
+              if (!SENSITIVE_HEADERS.has(k.toLowerCase())) {
                 sanitizedHeaders[k] = String(v);
               }
             }
           }
+          currentHeaders = sanitizedHeaders;
           options.headers = sanitizedHeaders;
         }
 

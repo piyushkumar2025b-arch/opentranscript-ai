@@ -57,11 +57,22 @@ echo ""
 
 # Initialize Database Schema
 echo "Step 3: Initialize Database Schema"
-read -p "Apply database schema? (y/n) " schemaChoice
+read -p "Apply database schema to remote D1? (y/n) " schemaChoice
 if [ "$schemaChoice" = "y" ]; then
-    echo "Applying database schema..."
-    wrangler d1 execute opentranscript-db --file=./cloudflare.d1.schema.sql
-    echo "✓ Database schema applied"
+    echo "Applying database schema to remote D1..."
+    wrangler d1 execute opentranscript-db --file=./cloudflare.d1.schema.sql --remote
+    if [ $? -ne 0 ]; then
+        echo "✗ Failed to apply schema to remote D1 database."
+        exit 1
+    fi
+    echo "Verifying remote D1 tables..."
+    verifyOutput=$(wrangler d1 execute opentranscript-db --command="SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'saved_lists');" --remote 2>&1)
+    if echo "$verifyOutput" | grep -q "users" && echo "$verifyOutput" | grep -q "saved_lists"; then
+        echo "✓ Database schema applied and verified on remote D1"
+    else
+        echo "✗ Remote table verification failed."
+        exit 1
+    fi
 fi
 
 echo ""

@@ -56,11 +56,22 @@ Write-Host ""
 
 # Initialize Database Schema
 Write-Host "Step 3: Initialize Database Schema" -ForegroundColor Yellow
-$schemaChoice = Read-Host "Apply database schema? (y/n)"
+$schemaChoice = Read-Host "Apply database schema to remote D1? (y/n)"
 if ($schemaChoice -eq "y") {
-    Write-Host "Applying database schema..." -ForegroundColor Gray
-    wrangler d1 execute opentranscript-db --file=./cloudflare.d1.schema.sql
-    Write-Host "✓ Database schema applied" -ForegroundColor Green
+    Write-Host "Applying database schema to remote D1..." -ForegroundColor Gray
+    wrangler d1 execute opentranscript-db --file=./cloudflare.d1.schema.sql --remote
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "✗ Failed to apply schema to remote D1 database." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Verifying remote D1 tables..." -ForegroundColor Gray
+    $verifyOutput = wrangler d1 execute opentranscript-db --command="SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'saved_lists');" --remote 2>&1 | Out-String
+    if ($verifyOutput -match "users" -and $verifyOutput -match "saved_lists") {
+        Write-Host "✓ Database schema applied and verified on remote D1" -ForegroundColor Green
+    } else {
+        Write-Host "✗ Remote table verification failed." -ForegroundColor Red
+        exit 1
+    }
 }
 
 Write-Host ""

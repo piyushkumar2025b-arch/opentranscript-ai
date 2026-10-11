@@ -14,9 +14,14 @@ Write-Host ""
 Write-Host "Checking prerequisites..." -ForegroundColor Yellow
 try {
     $nodeVersion = node --version
+    $major = [int]($nodeVersion -replace '^v(\d+)\..*', '$1')
+    if ($major -lt 20) {
+        Write-Host "✗ Node.js $nodeVersion is not supported. Vite 8 requires Node.js v20.19+ or v22 LTS." -ForegroundColor Red
+        exit 1
+    }
     Write-Host "✓ Node.js installed: $nodeVersion" -ForegroundColor Green
 } catch {
-    Write-Host "✗ Node.js is not installed. Please install Node.js v18+" -ForegroundColor Red
+    Write-Host "✗ Node.js is not installed. Please install Node.js v22 LTS (or v20.19+)" -ForegroundColor Red
     exit 1
 }
 
