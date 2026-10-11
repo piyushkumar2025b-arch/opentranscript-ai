@@ -1,0 +1,67 @@
+name: Deploy to Cloudflare Pages
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write   # so the bot can post preview URL comments on PRs
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Node.js ───────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 4. Lint / type-check ───────────────────────────────────────────────
+      - name: Type check
+        run: npm run lint
+        continue-on-error: true   # warn but don't block deploy on type errors
+
+      # ── 5. Build ───────────────────────────────────────────────────────────
+      - name: Build
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      # ── 6. Deploy to Cloudflare Pages ──────────────────────────────────────
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=opentranscript-ai
+          # For pull requests this creates a preview deployment.
+          # For pushes to master/main it promotes to production.
+
+      # ── 7. Apply D1 schema migrations (production only) ───────────────────
+      - name: Apply D1 migrations
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute opentranscript-db --file=./cloudflare.d1.schema.sql --remote
+        continue-on-error: true   # schema is idempotent (CREATE TABLE IF NOT EXISTS)
